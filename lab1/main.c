@@ -282,8 +282,8 @@ main()
     PinMuxConfig();
     DisplayBanner(APP_NAME);
 
-    //InitTerm();
-    //ClearTerm();
+    InitTerm();
+    ClearTerm();
 
     long int sw3=0;
     long int sw2=0;
