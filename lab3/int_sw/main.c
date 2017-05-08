@@ -1,3 +1,18 @@
+//*****************************************************************************
+//
+// Application Name     - int_sw
+// Application Overview - The objective of this application is to demonstrate
+//                          GPIO interrupts using SW2 and SW3.
+//                          NOTE: the switches are not debounced!
+//
+//*****************************************************************************
+
+//****************************************************************************
+//
+//! \addtogroup int_sw
+//! @{
+//
+//****************************************************************************
 
 // Standard includes
 #include <stdio.h>
@@ -23,7 +38,11 @@
 #include "pin_mux_config.h"
 #include "timer_if.h"
 #include "timer.h"
-
+#include "uart_if.h"
+#include "spi.h"
+#include "Adafruit_SSD1351.h"
+#include "Adafruit_GFX.h"
+#include "i2c_if.h"
 
 //*****************************************************************************
 //                 GLOBAL VARIABLES -- Start
@@ -47,7 +66,7 @@ int temp;
 
 // button bit patterns: stored in an array of arrays
 // index is the button number
-// index 10 = enter; index 11 = mute
+// index 10 = mute; index 11 = last/enter
 int patterns[25][12] = {
     {0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0} ,
     {0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0} ,
@@ -76,23 +95,40 @@ int patterns[25][12] = {
     {0, 1, 0, 0, 0, 0, 1, 1, 0, 1, 0, 0}
 };
 
+// char array of arrays to keep hold all the characters
+char letters[9][4] = {
+    {' ', ' ', ' ', ' '} ,
+    {'J', 'K', 'L', '0'} ,
+    {'A', 'B', 'C', '0'} ,
+    {'D', 'E', 'F', '0'} ,
+    {'G', 'H', 'I', '0'} ,
+    {'M', 'N', 'O', '0'} ,
+    {'P', 'Q', 'R', 'S'} ,
+    {'T', 'U', 'V', '0'} ,
+    {'W', 'X', 'Y', 'Z'}
+};
+
+// variables to keep track of character display per button press
+int char_i;
+int prev_button;
+
 //array to compare received signals to bit patterns
 int checker[12] = {};
 
 // variables to get bits from input
-volatile unsigned char high_flag;
-volatile unsigned long delta;
 volatile unsigned long start;
-volatile unsigned long end;
-volatile unsigned long time;
 volatile unsigned char done;
-int count;
 int i;
-int interrupts;
-volatile unsigned char special;
 volatile unsigned char t;
 int s;
-//volatile unsigned char bit_flag;
+int button;
+
+// character buffer for holding characters of message to be printed
+char message[100];
+int message_i;
+
+/************************ MACROS *********************************************/
+#define SPI_IF_BIT_RATE  100000
 
 //*****************************************************************************
 //                 GLOBAL VARIABLES -- End
@@ -120,15 +156,32 @@ void print_button(void) {
                 break;
             }
             else if(b == 11) {                      // pattern matched
-                //Report("checker: %d, pattern: %d \n\r", checker[b], patterns[a][b]);
                 click = a / 2;
-                if(click == 10)
-                    Report("Mute pressed. \n\r");
+                if(click == 10)                     // mute
+                    button = 10;
                 else if(click == 11)
-                    Report("Last pressed. \n\r");
-                else if(click == 0 || click == 1 || click ==  2 || click == 3 || click == 4 || click == 5 || click == 6 ||
-                        click == 7 || click == 8 || click == 9)
-                    Report("%d pressed. \n\r", click);
+                    button = 11;                    // last
+                // button 5 doesn't work; use 1 to replace 5's numbers
+                else if(click == 0 || click == 1 || click ==  2 || click == 3 || click == 4 || click == 5 ||
+                        click == 6 || click == 7 || click == 8 || click == 9) {
+                    if(click >= 5)
+                        button = click - 1;                 // re-map all buttons greater than 5 to button number one less
+                    else
+                        button = click;
+                    char_i++;
+                    // index 6 == button 7, index 8 = button 9
+                    // case where button represents 4 characters
+                    // reset index when prev button pressed is not the same as current button
+                    if(button != prev_button) {
+                        char_i = 0;
+                    }
+                    else if(char_i == 3 && button != 6 && button != 8) {
+                        char_i = 0;                // reset back to 0 index because we need to print first char of that button again
+                    }
+                    else if(char_i == 4) {
+                        char_i = 0;
+                    }
+                }
                 else
                     Report("Please press button again. \n\r");
                 click = 0;
@@ -136,80 +189,76 @@ void print_button(void) {
                 break;
             }
         }
-        if(t == 1)
+        //want to stop searching through the bit patterns if a match is found
+        if(t == 1) {
+            prev_button = button;
             break;
+        }
     }
 }
 
+//prints the specified character onto the terminal
+void print_char() {
+    char cChar, t_char;
+    int i;
+
+    cChar = letters[button][char_i];
+    MAP_UARTCharPut(UARTA0_BASE, cChar);
+
+    // if last pressed
+    // save the current character into message buffer
+    if(button == 11) {
+        message[message_i]= cChar;
+        message_i++;
+    }
+
+    //print the characters in the buffer if mute is pressed
+    else if(button == 10) {
+        Report("\n\r");
+        message[message_i] = '\0';
+        for(i = 0; i < message_i; i++) {
+            t_char = message[i];
+            MAP_UARTCharPut(UARTA0_BASE, t_char);
+        }
+        Report("\n\r");
+    }
+}
+
+// GPIO interrupt handler
 static void GPIOA0IntHandler(void) { // pin 61 handler
     unsigned long ulStatus;
 
     pin_intflag = 1;
-
-    //interrupts++;
 
     ulStatus = MAP_GPIOIntStatus (GPIOA0_BASE, true);
     MAP_GPIOIntClear(GPIOA0_BASE, ulStatus);        // clear interrupts on GPIOA1
 
     start = TimerValueGet(TIMERA0_BASE, TIMER_A);
     TimerValueSet(TIMERA0_BASE, TIMER_A, 0);
-    //Report("start: %d \n\r", start);
+
+    // if pulse length is greater than threshold for bit 1 but less than threshold for special character
+    // and if we've seen two interrupts
     if (start > 200000 && start < 7000000 && s == 2) {
         checker[i]=1;
         i++;
     }
+    // if pulse length is smaller than threshold for 1
+    // and if we've seen two interrupts
     else if (start < 200000 && s == 2) {
         checker[i]=0;
         i++;
     }
     else if (start > 7000000) {         // special character
         s++;
+        // if we've seen 3 interrupts
+        // we are done setting the current button's bit pattern
+        // reset values
         if(s == 3) {
             done = 1;
             i = 0;
             s = 0;
         }
     }
-//    if(count == 0) {
-//        start = TimerValueGet(TIMERA0_BASE, TIMER_A);
-//        count++;
-//    }
-//    else if(count == 1) {
-//        end = TimerValueGet(TIMERA0_BASE, TIMER_A);
-//        delta = end - start - 4294800000;
-//        t = end;
-//        start = t;
-//        TimerLoadSet(TIMERA0_BASE, TIMER_A, 0x0);
-////        start = TimerValueGet(TIMERA0_BASE, TIMER_A);
-//
-//        if(delta > 7000000 && s == 0) {       // special character
-//            special = 1;
-//            s++;
-//        }
-//
-////        else if(delta > 7000000 && s == 2) {
-////            done = 1;
-////            s = 0;
-////            Report("special2");
-////        }
-//
-//        else if(special == 1 && s == 1 && i == 17) {       // start reading pattern
-//            if(delta > 100000 && delta < 1000000) {         // 1
-//                checker[i] = 1;
-//                Report("1");
-//                i++;
-//            }
-//            else if(delta < 100000 && delta > 1000) {       // 0
-//                checker[i] = 0;
-//                Report("0");
-//                i++;
-//            }
-//        }
-//    }
-}
-
-void reset(void) {
-    TimerValueSet(TIMERA0_BASE, TIMER_A, 0x0);
 }
 
 //*****************************************************************************
@@ -243,75 +292,65 @@ BoardInit(void) {
 //
 //****************************************************************************
 
-//void printpattern(unsigned long int pattern) {
-//
-//    if (pattern == b1) {
-//        Report("Button 1 was pressed.");
-//    }
-//    if (pattern == b2) {
-//           Report("Button 2 was pressed.");
-//       }
-//    if (pattern == b3) {
-//           Report("Button 3 was pressed.");
-//       }
-//    if (pattern == b4) {
-//           Report("Button 4 was pressed.");
-//       }
-//    if (pattern == b5) {
-//           Report("Button 5 was pressed.");
-//       }
-//    if (pattern == b6) {
-//           Report("Button 6 was pressed.");
-//       }
-//    if (pattern == b7) {
-//           Report("Button 7 was pressed.");
-//       }
-//    if (pattern == b8) {
-//           Report("Button 8 was pressed.");
-//       }
-//    if (pattern == b9) {
-//           Report("Button 9 was pressed.");
-//       }
-//    if (pattern == mute) {
-//           Report("Button mute (delete) was pressed.");
-//       }
-//    if (pattern == enter) {
-//           Report("Button enter was pressed.");
-//       }
-//}
-
-
 int main() {
     unsigned long ulStatus;
-    unsigned long g_ulBase;
-
-    int c;
 
     BoardInit();
 
     PinMuxConfig();
 
+    // I2C Init
+    I2C_IF_Open(1);
+
+    // Enable the SPI module clock
+    MAP_PRCMPeripheralClkEnable(PRCM_GSPI,PRCM_RUN_MODE_CLK);
+
+    // Reset the peripheral
+    MAP_PRCMPeripheralReset(PRCM_GSPI);
+
+    // Reset SPI
+    MAP_SPIReset(GSPI_BASE);
+
+    //initialize modules, configure SPI
+    MAP_SPIConfigSetExpClk(GSPI_BASE,MAP_PRCMPeripheralClockGet(PRCM_GSPI),
+                     SPI_IF_BIT_RATE,SPI_MODE_MASTER,SPI_SUB_MODE_0,
+                     (SPI_SW_CTRL_CS |
+                     SPI_4PIN_MODE |
+                     SPI_TURBO_OFF |
+                     SPI_CS_ACTIVEHIGH |
+                     SPI_WL_8));
+
+    // Enable SPI for communication
+    MAP_SPIEnable(GSPI_BASE);
+    SPICSEnable(GSPI_BASE);
+
+    // Initialize Adafruit OLED configs
+    Adafruit_Init();
+    //DisplayBanner();
+
+    SPICSDisable(GSPI_BASE);
+
     InitTerm();
 
     ClearTerm();
 
-    delta = 0;
     start = 0;
-    end = 0;
-    count = 0;
 
     // Configuring the timers
     Timer_IF_Init(PRCM_TIMERA0, TIMERA0_BASE, TIMER_CFG_PERIODIC_UP, TIMER_A, 255);
 
+    // Setup the interrupts for the timer timeouts.
+    //Timer_IF_IntSetup(g_ulBase, TIMER_A, TimerBaseIntHandler);
+
     // Turn on the timers feeding values in mSec
     Timer_IF_Start(TIMERA0_BASE, TIMER_A, 4000000000);
 
+    //
     // Register the interrupt handlers
     MAP_GPIOIntRegister(GPIOA0_BASE, GPIOA0IntHandler);
 
     // Configure rising edge interrupts
     MAP_GPIOIntTypeSet(GPIOA0_BASE, 0x40, GPIO_FALLING_EDGE);
-    //MAP_GPIOIntTypeSet(GPIOA0_BASE, 0x40, GPIO_RISING_EDGE);
 
     ulStatus = MAP_GPIOIntStatus (GPIOA0_BASE, true);
     MAP_GPIOIntClear(GPIOA0_BASE, ulStatus);            // clear interrupts on GPIOA1
@@ -319,12 +358,13 @@ int main() {
     pin_intflag=0;
     pin_intcount=0;
 
-    //high_flag = 1;
     done = 0;
     i = 0;
     t = 0;
     s = 1;
-    //interrupts = 0;
+    char_i = -1;
+    prev_button = -1;
+    message_i = 0;
 
     // Enable pin 61 interrupt
     MAP_GPIOIntEnable(GPIOA0_BASE, 0x40);
@@ -340,17 +380,24 @@ int main() {
             while (pin_intflag==0) {;}
             if (pin_intflag) {
                 pin_intflag=0;
-                //Report("\t delta = %lu \n", delta);
-                //TimerValueSet(TIMERA0_BASE, TIMER_A, 0x0);
             }
             if(done) {
                 print_button();
-                //Report("\r\n");
+                print_char();
                 done = 0;
                 t = 0;
-                //high_flag = 1;
                 i = 0;
-//                //interrupts = 0;
+                if(message[1] != NULL) {
+                    Report("\r\n");
+                    Report("%c", &message[1]);
+                }
             }
         }
 }
+
+//*****************************************************************************
+//
+// Close the Doxygen group.
+//! @}
+//
+//*****************************************************************************
